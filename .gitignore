@@ -33,8 +33,11 @@ htmlcov/
 *.sqlite
 ncu_metrics.txt
 
-# Results and generated outputs
+# Results and generated outputs (PNGs excepted so README images render on GitHub)
 results/
+!results/report/*.png
+!results/screenshots/
+!results/screenshots/*.png
 
 # OS files
 .DS_Store
