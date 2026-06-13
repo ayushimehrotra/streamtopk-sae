@@ -34,9 +34,12 @@ htmlcov/
 ncu_metrics.txt
 
 # Results and generated outputs (PNGs excepted so README images render on GitHub)
-results/
+results/*
+!results/report/
+results/report/*
 !results/report/*.png
 !results/screenshots/
+results/screenshots/*
 !results/screenshots/*.png
 
 # OS files
