@@ -109,23 +109,42 @@ All 57 tests should pass. Expected output:
 ### Running benchmarks
 
 ```bash
-# Smoke-test dry runs (fast)
+# Smoke-test dry runs (fast, ~5 s each)
 python -m bench.run_runtime   --dry-run
 python -m bench.run_memory    --dry-run
 python -m bench.run_bandwidth --dry-run
 python -m bench.run_recall    --dry-run
 python -m bench.run_max_F     --dry-run
+```
 
-# Full benchmarks (writes CSVs to results/)
-python -m bench.run_runtime   --warmup 10 --iters 100
-python -m bench.run_memory  # runs each cell in a subprocess for clean CUDA allocator isolation
+The full `BENCH_GRID` (4 B × 3 d × 5 F × 4 k × 3 dtype) has 720 cells. Running all 6 implementations at 110 iterations each takes several hours. Use filter flags to target the subset you care about:
+
+```bash
+# Recommended subset: ~10–20 min on RTX A5000
+python -m bench.run_runtime \
+    --impl eager,cuda_exact,cuda_approx \
+    --B 32,128 --d 768 --dtype bf16
+
+# Full memory benchmark (subprocesses for allocator isolation, ~15 min)
+python -m bench.run_memory --impl eager,cuda_exact,cuda_approx
+
+# Bandwidth (fixed representative cells, ~2 min)
 python -m bench.run_bandwidth
-python -m bench.run_recall
-python -m bench.run_max_F
 
-# Generate report tables and plots
+# Recall benchmark — the full RECALL_GRID (2 B × 2 d × 3 F × 2 k × 5 c = 120 cells)
+# is expensive at large F. Restrict to the measured subset:
+python -m bench.run_recall --B 128 --d 2048 --F 65536,262144,1048576
+
+# Max feasible F (binary search per impl, ~5 min)
+python -m bench.run_max_F
+```
+
+```bash
+# Generate report tables and plots (reads existing CSVs from results/)
 python -m bench.report
-# Output: results/report/{runtime_table.md, memory_table.md, roofline.pdf, recall.pdf, runtime_bar.pdf, memory.pdf}
+# Output: results/report/{runtime_table.md, memory_table.md,
+#          roofline.{pdf,png}, recall.{pdf,png},
+#          runtime_bar.{pdf,png}, memory.{pdf,png}}
 ```
 
 ---
@@ -219,16 +238,16 @@ All implementations match the dense reference (`reference_topk_sae`) within `ato
 
 | Shape | eager | cuda\_exact | cuda\_approx | cpu |
 |---|---|---|---|---|
-| B=4, d=64, F=256, k=8, fp32 | 132 | **52** | 103 | 18 |
-| B=32, d=768, F=16384, k=16, bf16 | 229 | **4,911**† | 10,402 | 105,799 |
-| B=32, d=768, F=65536, k=32, bf16 | 412 | 71,811 | 58,757 | 426,151 |
-| B=128, d=768, F=65536, k=32, bf16 | 913 | 218,486 | 219,504 | 1,701,559 |
-| B=128, d=2048, F=65536, k=32, bf16 | 1,185 | 574,288 | 421,380 | 4,490,486 |
-| B=32, d=768, F=262144, k=32, bf16 | 1,276 | 293,377 | 235,756 | 1,634,178 |
+| B=32, d=768, F=16384, k=16, bf16 | 197 | **2,267**† | 4,971 | 105,799 |
+| B=32, d=768, F=16384, k=32, bf16 | 275 | 17,851 | 10,395 | — |
+| B=32, d=768, F=65536, k=32, bf16 | 421 | 70,672 | 41,155 | 426,151 |
+| B=128, d=768, F=65536, k=32, bf16 | 938 | 197,967 | 163,783 | 1,701,559 |
+| B=32, d=768, F=262144, k=32, bf16 | 1,264 | 281,163 | 163,603 | 1,634,178 |
+| B=128, d=768, F=262144, k=32, bf16 | 2,870 | 777,305 | 654,006 | — |
 
-† wmma tensor-core path active (B divisible by 16, K≤16, bf16).
+† wmma tensor-core path active (B divisible by 16, K≤16, bf16). cpu numbers for matching configs from an earlier run on the same hardware (CPU implementation unchanged).
 
-`cuda_exact` is 50–500× slower than eager cuBLAS for non-trivial shapes; the F=256 case is a fixed-overhead win. CPU is 100–3000× slower than `cuda_exact`. `cuda_approx` uses `c=max(16,k)` candidates per tile; recall@k < 1 for small c — see recall plot below.
+`cuda_exact` is 12–270× slower than eager cuBLAS; the wmma path (K≤16, bf16) narrows the gap. `cuda_approx` is faster than `cuda_exact` for K≥32 (lighter per-tile reduction) at the cost of recall. CPU is 6–47× slower than `cuda_exact`.
 
 ![Runtime comparison](results/report/runtime_bar.png)
 
@@ -264,7 +283,7 @@ All three implementations scale linearly with F. `cuda_exact`'s working memory i
 
 ![Roofline](results/report/roofline.png)
 
-The roofline plots achieved performance (GFLOPS) against arithmetic intensity (FLOP/byte) on an NVIDIA RTX A5000 (peak 222.2 TFLOPS bf16, 768 GB/s HBM). All implementations sit at ~128 FLOP/byte arithmetic intensity — above the ridge point of 289 FLOP/byte, meaning the workload should be compute-bound. However, `cuda_exact` and `cuda_approx` achieve only 0.2–0.9 GB/s effective HBM bandwidth (0.1–0.4% of peak), far below the memory roof. This reveals that the kernels are **latency-bound**, not bandwidth-bound: each SM runs only 64 threads (4 warps) out of a maximum of 1536, so the GPU spends most cycles waiting for HBM round-trips rather than computing.
+The roofline plots achieved performance (GFLOPS) against arithmetic intensity (FLOP/byte) on an NVIDIA RTX A5000 (peak 222.2 TFLOPS bf16, 768 GB/s HBM). All implementations sit at ~128 FLOP/byte arithmetic intensity — above the ridge point of 289 FLOP/byte, meaning the workload should be compute-bound. However, `cuda_exact` and `cuda_approx` achieve only 0.2–0.9 GB/s effective HBM bandwidth (0.1–0.4% of peak), far below the memory roof. This reveals that the kernels are **latency-bound**, not bandwidth-bound: each SM runs only 64 threads (2 warps) out of a maximum of 1536, so the GPU spends most cycles waiting for HBM round-trips rather than computing.
 
 ### Nsight Compute Kernel Metrics
 
@@ -282,13 +301,30 @@ Profiled with `ncu --set full` on `streamtopk_exact_tile_kernel` (B=32, F=16384,
 
 ![Speed of Light](results/screenshots/speed_of_light_throughput.png)
 
-**Memory Workload Analysis** — L1/TEX cache hit rate 20.57% (expected: each block loads different weight rows so L1 reuse is low). L2 cache hit rate **97.43%**: the W\_enc tile (≈25 MB for F=16384, d=768, bf16) fits in the 24 MB L2, so nearly all weight traffic is served from L2 rather than DRAM. Shared memory dominates at 39.76M instructions. Only 25.65 MB reaches device memory.
+**Memory Workload Analysis** — L1/TEX cache hit rate 20.57% (expected: each block loads different weight rows so L1 reuse is low). L2 cache hit rate **97.43%**: the 2D grid `(B, F/T)` means all B row-blocks that share the same F-tile access the same ≈32 KB weight slice, which stays in L2 while those blocks are scheduled, giving excellent temporal reuse despite W\_enc totalling 25 MB — far larger than the A5000's 6 MB L2. Shared memory dominates at 39.76M instructions. Only 25.65 MB reaches device memory.
 
 ![Memory Workload Analysis](results/screenshots/memory_analysis.png)
 
 **Warp State Statistics** — Stall Long Scoreboard (~4.5 cycles average) is the dominant stall: warps stall waiting for global→shared memory loads to complete. Stall Barrier (~2.2) reflects `__syncthreads()` gaps between the load and compute phases. The "Selected" bar (~1.5) — actual warp execution — is smaller than the dominant stall, confirming the kernel spends more time waiting than computing.
 
 ![Warp State Statistics](results/screenshots/warp_state.png)
+
+### Recall Analysis
+
+![Recall vs c](results/report/recall.png)
+
+Benchmarked on random bf16 data (B=128, d=2048, varying F and k, c\_multiplier ∈ {1,2,4,8,16}; c is snapped to the nearest supported value in {16,32,64,128} and capped at T=128 per tile).
+
+| F | k | recall |
+|---|---|---|
+| 65,536 | 32 | **96%** |
+| 65,536 | 64 | **100%** |
+| 262,144 | 32 | **83%** |
+| 262,144 | 64 | **94%** |
+| 1,048,576 | 32 | **100%** |
+| 1,048,576 | 64 | **100%** |
+
+Recall is essentially flat across c values (the lines in the plot are horizontal): once the true top-k latents score high enough above within-tile noise that c=k captures them, adding more candidates does not help. At F=1M, scores are so extreme relative to tile-local noise that even c=k gives perfect recall. At F=262,144 with k=32, ~17% of the true top-k lose to noise within their T=128 tile — this gap would require a larger tile or score normalization to close, not simply a larger candidate budget.
 
 ### Occupancy Analysis
 
@@ -300,7 +336,7 @@ With `BLOCK_THREADS=64` and shared memory ~50 KB per block (K=32, bf16, with row
 
 The row padding fix (`W_SMEM_PAD=2`, bank stride 33 → zero bank conflicts for bf16/fp16) reduced shared memory bank conflicts by **64%** (148M → 54M) and yielded a **1.2× runtime speedup** despite the occupancy reduction, confirming that conflict stalls were the dominant bottleneck.
 
-The primary bottleneck is that most of each SM's warp schedulers are starved. Each block issues 4 warps that stall waiting on global memory loads; the other 44 warp slots on the SM are empty.
+The primary bottleneck is that most of each SM's warp schedulers are starved. Each block issues 2 warps that stall waiting on global memory loads; the other 46 warp slots on the SM are empty.
 
 ---
 
@@ -308,15 +344,15 @@ The primary bottleneck is that most of each SM's warp schedulers are starved. Ea
 
 | Metric | CPU (OpenMP) | GPU (cuda\_exact) | GPU (eager) |
 |---|---|---|---|
-| B=32, F=65536, bf16 | 426 ms | 72 ms | 0.41 ms |
-| B=128, F=65536, bf16 | 1,702 ms | 218 ms | 0.91 ms |
+| B=32, F=65536, bf16 | 426 ms | 71 ms | 0.42 ms |
+| B=128, F=65536, bf16 | 1,702 ms | 198 ms | 0.94 ms |
 | Memory model | O(B·T·k) | O(B·T·d) | O(B·F) |
 | Scales with F | Linear | Linear | Linear |
 | Max F at B=2048 | Unlimited\* | 4,194,304 | 262,144 |
 
 \*CPU is not memory-constrained but becomes impractically slow (hours) for F > 1M.
 
-The GPU streaming kernel is **6–8× faster than CPU** while preserving the memory-efficiency guarantee. Eager cuBLAS is **175–480× faster** than the streaming kernel but OOMs at large F.
+The GPU streaming kernel is **6–8× faster than CPU** while preserving the memory-efficiency guarantee. Eager cuBLAS is **170–210× faster** than the streaming kernel but OOMs at large F.
 
 ---
 
@@ -342,15 +378,9 @@ The original w\_smem layout (`scalar_t w_smem[T][D_TILE]`) had a row stride of 6
 
 Was implemented and benchmarked. For K=32 the doubled smem (80 KB vs 48 KB) forced 1 block/SM instead of 2, halving occupancy with insufficient latency-hiding to compensate (0.55–0.68× regression). Would be beneficial at K≤16 where smem stays under the 2-blocks/SM threshold.
 
-### 5. Better approximate kernel threshold
+### 6. Better approximate kernel threshold
 
 The approx kernel keeps a fixed top-c per tile regardless of score distribution. An adaptive threshold (keep all scores above `μ + σ` of the tile) could achieve the same recall with fewer candidates, reducing the Python-side `torch.topk` cost.
-
-### 6. Recall plot
-
-![Recall vs c](results/report/recall.png)
-
-With `c=k=32` candidates per tile the approximate kernel achieves 64% recall at F=65536 on random data. Recall improves to 91% at F=262144 (fewer latents competing per tile). At F=16384 (tile size = F), recall is 100% regardless of c.
 
 ---
 
