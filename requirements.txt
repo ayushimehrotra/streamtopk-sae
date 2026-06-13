@@ -1,0 +1,9 @@
+torch>=2.3
+triton>=2.3
+numpy
+scipy
+pytest
+pandas
+tabulate
+matplotlib
+tqdm
