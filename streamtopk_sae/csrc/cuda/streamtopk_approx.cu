@@ -31,6 +31,9 @@ static constexpr int BLOCK_THREADS_APPROX = 64;
 static constexpr int T_APPROX             = 128; // latent tile size
 static constexpr int D_TILE_APPROX        = 64;
 static constexpr int LATENTS_PER_THREAD_APPROX = T_APPROX / BLOCK_THREADS_APPROX;
+// Same padding as exact kernel: eliminates 32-way bank conflicts for bf16/fp16.
+static constexpr int W_SMEM_PAD_APPROX    = 2;
+static constexpr int W_SMEM_STRIDE_APPROX = D_TILE_APPROX + W_SMEM_PAD_APPROX;  // 66
 
 // Kernel: fills candidate_vals and candidate_idxs with top-c per tile per row.
 // M12: 2D grid — one block per (row, F-tile), matching the exact kernel's approach.
@@ -48,7 +51,7 @@ __global__ void streamtopk_approx_kernel(
     extern __shared__ char smem_raw[];
     scalar_t* x_smem   = reinterpret_cast<scalar_t*>(smem_raw);
     scalar_t* w_smem   = x_smem + D_TILE_APPROX;
-    float*    red_vals = reinterpret_cast<float*>(w_smem + T_APPROX * D_TILE_APPROX);
+    float*    red_vals = reinterpret_cast<float*>(w_smem + T_APPROX * W_SMEM_STRIDE_APPROX);
     int32_t*  red_idxs = reinterpret_cast<int32_t*>(red_vals + BLOCK_THREADS_APPROX * C);
 
     int row    = blockIdx.x;
@@ -81,13 +84,13 @@ __global__ void streamtopk_approx_kernel(
             for (int idx = tid; idx < total_w; idx += BLOCK_THREADS_APPROX) {
                 int fi = idx >> 6;
                 int di = idx & 63;
-                w_smem[fi * D_TILE_APPROX + di] = W_enc[(f_start + fi) * d + d_start + di];
+                w_smem[fi * W_SMEM_STRIDE_APPROX + di] = W_enc[(f_start + fi) * d + d_start + di];
             }
         } else {
             for (int idx = tid; idx < tile_f * tile_d; idx += BLOCK_THREADS_APPROX) {
                 int fi = idx / tile_d;
                 int di = idx % tile_d;
-                w_smem[fi * D_TILE_APPROX + di] = W_enc[(f_start + fi) * d + d_start + di];
+                w_smem[fi * W_SMEM_STRIDE_APPROX + di] = W_enc[(f_start + fi) * d + d_start + di];
             }
         }
         __syncthreads();
@@ -97,7 +100,7 @@ __global__ void streamtopk_approx_kernel(
             int fi = tid + li * BLOCK_THREADS_APPROX;
             if (fi < tile_f) {
                 float acc = 0.0f;
-                const scalar_t* wrow = w_smem + fi * D_TILE_APPROX;
+                const scalar_t* wrow = w_smem + fi * W_SMEM_STRIDE_APPROX;
                 if (tile_d == D_TILE_APPROX) {
                     #pragma unroll
                     for (int di = 0; di < D_TILE_APPROX; ++di)
@@ -166,7 +169,7 @@ __global__ void streamtopk_approx_kernel(
 static size_t smem_bytes_approx(int C, bool is_half) {
     size_t scalar_size = is_half ? 2 : 4;
     size_t x_smem   = D_TILE_APPROX * scalar_size;
-    size_t w_smem   = T_APPROX * D_TILE_APPROX * scalar_size;
+    size_t w_smem   = T_APPROX * W_SMEM_STRIDE_APPROX * scalar_size;
     size_t red_vals = BLOCK_THREADS_APPROX * C * sizeof(float);
     size_t red_idxs = BLOCK_THREADS_APPROX * C * sizeof(int32_t);
     return x_smem + w_smem + red_vals + red_idxs;

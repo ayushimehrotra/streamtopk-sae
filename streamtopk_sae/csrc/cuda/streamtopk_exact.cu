@@ -38,6 +38,11 @@ static constexpr int D_TILE        = 64;
 static constexpr int D_MAX         = 4096;
 static constexpr int T_HALF  = 256;
 static constexpr int T_FLOAT = 128;
+// Pad each w_smem row by 2 half-precision elements (4 bytes).
+// Row stride becomes 66 elements; bank stride = 66/2 = 33 (odd) → zero 32-bank
+// conflicts for bf16/fp16, and a large reduction for fp32.
+static constexpr int W_SMEM_PAD    = 2;
+static constexpr int W_SMEM_STRIDE = D_TILE + W_SMEM_PAD;   // 66
 
 __device__ __forceinline__ float to_f32(float v)         { return v; }
 __device__ __forceinline__ float to_f32(__half v)        { return __half2float(v); }
@@ -64,7 +69,7 @@ __global__ void streamtopk_exact_tile_kernel(
     extern __shared__ char smem_raw[];
     scalar_t* x_smem   = reinterpret_cast<scalar_t*>(smem_raw);
     scalar_t* w_smem   = x_smem + D_TILE;
-    float*    red_vals = reinterpret_cast<float*>(w_smem + T * D_TILE);
+    float*    red_vals = reinterpret_cast<float*>(w_smem + T * W_SMEM_STRIDE);
     int32_t*  red_idxs = reinterpret_cast<int32_t*>(red_vals + BLOCK_THREADS * K);
 
     int row    = blockIdx.x;
@@ -98,13 +103,13 @@ __global__ void streamtopk_exact_tile_kernel(
             for (int idx = tid; idx < total_w; idx += BLOCK_THREADS) {
                 int fi = idx >> 6;
                 int di = idx & 63;
-                w_smem[fi * D_TILE + di] = W_enc[(f_start + fi) * d + d_start + di];
+                w_smem[fi * W_SMEM_STRIDE + di] = W_enc[(f_start + fi) * d + d_start + di];
             }
         } else {
             for (int idx = tid; idx < tile_f * tile_d; idx += BLOCK_THREADS) {
                 int fi = idx / tile_d;
                 int di = idx % tile_d;
-                w_smem[fi * D_TILE + di] = W_enc[(f_start + fi) * d + d_start + di];
+                w_smem[fi * W_SMEM_STRIDE + di] = W_enc[(f_start + fi) * d + d_start + di];
             }
         }
         __syncthreads();
@@ -114,7 +119,7 @@ __global__ void streamtopk_exact_tile_kernel(
             int fi = tid + li * BLOCK_THREADS;
             if (fi < tile_f) {
                 float acc = 0.0f;
-                const scalar_t* wrow = w_smem + fi * D_TILE;
+                const scalar_t* wrow = w_smem + fi * W_SMEM_STRIDE;
                 if (tile_d == D_TILE) {
                     #pragma unroll
                     for (int di = 0; di < D_TILE; ++di)
@@ -218,7 +223,7 @@ __global__ void streamtopk_exact_tile_wmma_kernel(
     // Layout: x_smem[WARP_ROWS * D_TILE] | w_smem[T * D_TILE] | red[BT*K*8]
     __nv_bfloat16* x_smem   = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* w_smem   = x_smem + WARP_ROWS * D_TILE;
-    float*         red_vals = reinterpret_cast<float*>(w_smem + T * D_TILE);
+    float*         red_vals = reinterpret_cast<float*>(w_smem + T * W_SMEM_STRIDE);
     int32_t*       red_idxs = reinterpret_cast<int32_t*>(red_vals + BLOCK_THREADS * K);
 
     int base_row = blockIdx.x * WARP_ROWS;
@@ -274,13 +279,13 @@ __global__ void streamtopk_exact_tile_wmma_kernel(
             for (int idx = tid; idx < total_w; idx += BLOCK_THREADS) {
                 int fi = idx >> 6;
                 int di = idx & 63;
-                w_smem[fi * D_TILE + di] = W_enc[(f_start + fi) * d + d_start + di];
+                w_smem[fi * W_SMEM_STRIDE + di] = W_enc[(f_start + fi) * d + d_start + di];
             }
         } else {
             for (int idx = tid; idx < tile_f * tile_d; idx += BLOCK_THREADS) {
                 int fi = idx / tile_d;
                 int di = idx % tile_d;
-                w_smem[fi * D_TILE + di] = W_enc[(f_start + fi) * d + d_start + di];
+                w_smem[fi * W_SMEM_STRIDE + di] = W_enc[(f_start + fi) * d + d_start + di];
             }
         }
         __syncthreads();
@@ -301,8 +306,8 @@ __global__ void streamtopk_exact_tile_wmma_kernel(
                 if (lat_group * WMMA_M < tile_f) {
                     fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
                     load_matrix_sync(a_frag,
-                        w_smem + lat_group * WMMA_M * D_TILE + dk * WMMA_K,
-                        D_TILE);
+                        w_smem + lat_group * WMMA_M * W_SMEM_STRIDE + dk * WMMA_K,
+                        W_SMEM_STRIDE);
                     mma_sync(acc_frag[g], a_frag, b_frag, acc_frag[g]);
                 }
             }
@@ -411,7 +416,7 @@ static size_t smem_bytes_wmma(int K) {
     constexpr int WARPS = BLOCK_THREADS / WARP_SIZE;
     constexpr int LATS  = T_VAL / (WMMA_M * WARPS);
     size_t x_bytes   = WARP_ROWS * D_TILE * 2;
-    size_t w_bytes   = (size_t)T_VAL * D_TILE * 2;
+    size_t w_bytes   = (size_t)T_VAL * W_SMEM_STRIDE * 2;
     size_t score_tmp = (size_t)WARPS * LATS * WMMA_M * WMMA_N * 4;
     size_t red_bytes = (size_t)BLOCK_THREADS * K * (sizeof(float) + sizeof(int32_t));
     return x_bytes + w_bytes + std::max(score_tmp, red_bytes);
@@ -512,7 +517,7 @@ __global__ void streamtopk_exact_single_kernel(
     extern __shared__ char smem_raw[];
     scalar_t* x_smem   = reinterpret_cast<scalar_t*>(smem_raw);
     scalar_t* w_smem   = x_smem + D_TILE;
-    float*    red_vals = reinterpret_cast<float*>(w_smem + T * D_TILE);
+    float*    red_vals = reinterpret_cast<float*>(w_smem + T * W_SMEM_STRIDE);
     int32_t*  red_idxs = reinterpret_cast<int32_t*>(red_vals + BLOCK_THREADS * K);
 
     int row = blockIdx.x;
@@ -548,13 +553,13 @@ __global__ void streamtopk_exact_single_kernel(
                 for (int idx = tid; idx < total_w; idx += BLOCK_THREADS) {
                     int fi = idx >> 6;
                     int di = idx & 63;
-                    w_smem[fi * D_TILE + di] = W_enc[(f_start + fi) * d + d_start + di];
+                    w_smem[fi * W_SMEM_STRIDE + di] = W_enc[(f_start + fi) * d + d_start + di];
                 }
             } else {
                 for (int idx = tid; idx < tile_f * tile_d; idx += BLOCK_THREADS) {
                     int fi = idx / tile_d;
                     int di = idx % tile_d;
-                    w_smem[fi * D_TILE + di] = W_enc[(f_start + fi) * d + d_start + di];
+                    w_smem[fi * W_SMEM_STRIDE + di] = W_enc[(f_start + fi) * d + d_start + di];
                 }
             }
             __syncthreads();
@@ -564,7 +569,7 @@ __global__ void streamtopk_exact_single_kernel(
                 int fi = tid + li * BLOCK_THREADS;
                 if (fi < tile_f) {
                     float acc = 0.0f;
-                    const scalar_t* wrow = w_smem + fi * D_TILE;
+                    const scalar_t* wrow = w_smem + fi * W_SMEM_STRIDE;
                     if (tile_d == D_TILE) {
                         #pragma unroll
                         for (int di = 0; di < D_TILE; ++di)
@@ -638,7 +643,7 @@ __global__ void streamtopk_exact_single_kernel(
 
 static size_t smem_bytes_tile(int K, int T, bool is_half) {
     size_t ss = is_half ? 2 : 4;
-    return D_TILE * ss + (size_t)T * D_TILE * ss +
+    return D_TILE * ss + (size_t)T * W_SMEM_STRIDE * ss +
            (size_t)BLOCK_THREADS * K * (sizeof(float) + sizeof(int32_t));
 }
 

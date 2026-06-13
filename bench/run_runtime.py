@@ -99,6 +99,14 @@ def bench_cell(impl_name, fn, cell, warmup, iters):
                 "dtype": dtype_str, "status": f"ERR:{e}"}
 
 
+def _parse_ints(s):
+    return [int(x) for x in s.split(",")]
+
+
+def _parse_strs(s):
+    return [x.strip() for x in s.split(",")]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--impl",    default=",".join(DEFAULT_IMPLS),
@@ -108,7 +116,21 @@ def main():
     parser.add_argument("--out",     default="results/runtime.csv")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run one cell per impl as smoke test")
+    parser.add_argument("--B",     type=_parse_ints, default=None, metavar="B,...")
+    parser.add_argument("--d",     type=_parse_ints, default=None, metavar="d,...")
+    parser.add_argument("--F",     type=_parse_ints, default=None, metavar="F,...")
+    parser.add_argument("--k",     type=_parse_ints, default=None, metavar="k,...")
+    parser.add_argument("--dtype", type=_parse_strs, default=None, metavar="dtype,...")
     args = parser.parse_args()
+
+    def apply_filters(cells):
+        for cell in cells:
+            if args.B     and cell["B"]     not in args.B:     continue
+            if args.d     and cell["d"]     not in args.d:     continue
+            if args.F     and cell["F"]     not in args.F:     continue
+            if args.k     and cell["k"]     not in args.k:     continue
+            if args.dtype and cell["dtype"] not in args.dtype: continue
+            yield cell
 
     impls = [x.strip() for x in args.impl.split(",")]
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -118,7 +140,10 @@ def main():
         fn = IMPL_FNS[impl_name]
         grid = BENCH_GRID_CPU if impl_name == "cpu" else BENCH_GRID
 
-        cells = [dry_run_cell(grid)] if args.dry_run else list(iter_grid(grid))
+        if args.dry_run:
+            cells = [dry_run_cell(grid)]
+        else:
+            cells = list(apply_filters(iter_grid(grid)))
 
         # Shuffle for randomized order
         if not args.dry_run:

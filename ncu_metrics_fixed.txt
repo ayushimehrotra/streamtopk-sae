@@ -1,0 +1,5 @@
+==PROF== Connected to process 2198328 (/usr/bin/python3.10)
+==PROF== Profiling "streamtopk_exact_tile_kernel" - 0: 0%....50%....100% - 8 passes
+==PROF== Profiling "streamtopk_exact_merge_kernel" - 1: 0%....50%....100% - 8 passes
+==PROF== Disconnected from process 2198328
+==PROF== Report: /home/amehrotra/streamtopk-sae/exact_profile_fixed.ncu-rep
